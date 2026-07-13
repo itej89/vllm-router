@@ -20,6 +20,7 @@ use axum::{
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
@@ -54,6 +55,8 @@ pub struct VllmPDRouter {
     profiling_tasks: Arc<Mutex<HashMap<String, tokio::task::AbortHandle>>>,
     /// Intra-node data parallel size for DP-aware routing (automatically enabled when > 1)
     intra_node_data_parallel_size: usize,
+    /// Round-robin counter for selecting prefill DP rank when workers register without @rank suffix
+    prefill_dp_round_robin: Arc<AtomicUsize>,
     /// KV connector type
     kv_connector: KvConnector,
     /// Mooncake bootstrap info: prefill base_url -> MooncakePrefillInfo
@@ -304,9 +307,12 @@ impl VllmPDRouter {
                         "remote_tp_size": tp_size,
                     });
                     if self.intra_node_data_parallel_size > 1 {
-                        if let Some(rank) = prefill_dp_rank {
-                            params["remote_dp_rank"] = json!(rank);
-                        }
+                        // Always set remote_dp_rank so decode sends its RDMA block-address
+                        // notification to the correct prefill DP worker's notify port.
+                        // prefill_dp_rank is None only for non-MoRIIO connectors or when DP=1;
+                        // for WRITE mode with DP>1 the round-robin selection above always fills it.
+                        let rank = prefill_dp_rank.unwrap_or(0);
+                        params["remote_dp_rank"] = json!(rank);
                     }
                     Some(params)
                 } else {
@@ -786,10 +792,25 @@ impl VllmPDRouter {
         // Generate a connector-specific transfer_id (None for NIXL)
         let transfer_id = self.generate_transfer_id();
 
-        let (prefill_base_http, prefill_dp_rank) =
+        let (prefill_base_http, mut prefill_dp_rank) =
             extract_base_http_and_dp_rank(prefill_http, self.intra_node_data_parallel_size);
         let (decode_base_http, decode_dp_rank) =
             extract_base_http_and_dp_rank(decode_http, self.intra_node_data_parallel_size);
+
+        // When workers register without @rank suffixes (service discovery path) and DP>1,
+        // select a DP rank via round-robin so we can route both the prefill X-data-parallel-rank
+        // header and the decode's remote_dp_rank to the same rank.
+        if self.intra_node_data_parallel_size > 1 && prefill_dp_rank.is_none() {
+            let rank = self
+                .prefill_dp_round_robin
+                .fetch_add(1, Ordering::Relaxed)
+                % self.intra_node_data_parallel_size;
+            prefill_dp_rank = Some(rank);
+            debug!(
+                "MoRIIO WRITE+DP: selected prefill dp_rank={} via round-robin (dp_size={})",
+                rank, self.intra_node_data_parallel_size
+            );
+        }
 
         // Add kv_transfer_params for KV connector support at top level
         prefill_request["kv_transfer_params"] =
@@ -799,7 +820,6 @@ impl VllmPDRouter {
             "Added kv_transfer_params to prefill request for {:?} connector",
             self.kv_connector
         );
-
         // Concurrent dispatch: e.g. MoRI-IO WRITE mode
         let is_concurrent_dispatch = matches!(self.kv_connector, KvConnector::MoriIO)
             && matches!(self.moriio_transfer_mode(), Some(MoriIOTransferMode::Write));
@@ -1584,6 +1604,7 @@ impl VllmPDRouter {
                 profile_timeout_secs: ctx.router_config.profile_timeout_secs,
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
+                prefill_dp_round_robin: Arc::new(AtomicUsize::new(0)),
                 kv_connector,
                 mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
             })
@@ -1672,6 +1693,7 @@ impl VllmPDRouter {
                 profile_timeout_secs: ctx.router_config.profile_timeout_secs,
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
+                prefill_dp_round_robin: Arc::new(AtomicUsize::new(0)),
                 kv_connector,
                 mooncake_prefill_info,
             })
