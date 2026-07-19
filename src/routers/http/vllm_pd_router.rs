@@ -966,10 +966,17 @@ impl VllmPDRouter {
             .header("Content-Type", "application/json")
             .header("X-Request-Id", &request_id); // Same P2P coordination metadata in header
 
-        // Add X-data-parallel-rank header using shared utilities
+        // Add X-data-parallel-rank header using shared utilities.
+        // In WRITE+EP discovery mode, decode_dp_rank is None (no @rank suffix in URL).
+        // Use prefill_dp_rank so both requests land on the same DP rank and KV ports align.
+        let effective_decode_dp_rank = if decode_dp_rank.is_none() && self.intra_node_data_parallel_size > 1 {
+            prefill_dp_rank
+        } else {
+            decode_dp_rank
+        };
         decode_request_builder =
-            dp_utils::add_dp_rank_header(decode_request_builder, decode_dp_rank);
-        if let Some(rank) = decode_dp_rank {
+            dp_utils::add_dp_rank_header(decode_request_builder, effective_decode_dp_rank);
+        if let Some(rank) = effective_decode_dp_rank {
             debug!(
                 "Added X-data-parallel-rank={} header to decode request",
                 rank
