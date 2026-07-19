@@ -206,6 +206,7 @@ impl VllmPDRouter {
         &self,
         transfer_id: Option<&str>,
         decode_base: Option<&str>,
+        decode_dp_rank: Option<usize>,
     ) -> Result<Value, String> {
         match self.kv_connector {
             KvConnector::Mooncake => Ok(json!({
@@ -229,7 +230,7 @@ impl VllmPDRouter {
                                 .0
                         })
                         .unwrap_or(1);
-                    Ok(json!({
+                    let mut params = json!({
                         "do_remote_decode": true,
                         "do_remote_prefill": false,
                         "remote_engine_id": serde_json::Value::Null,
@@ -237,7 +238,14 @@ impl VllmPDRouter {
                         "remote_dp_size": self.intra_node_data_parallel_size,
                         "remote_tp_size": remote_tp_size,
                         "transfer_id": transfer_id.unwrap_or(""),
-                    }))
+                    });
+                    if self.intra_node_data_parallel_size > 1 {
+                        // Tell prefill which decode DP rank to push KV to.
+                        // The connector uses this to compute the correct port offset:
+                        //   handshake_port + get_port_offset(remote_dp_rank, tp_rank)
+                        params["remote_dp_rank"] = json!(decode_dp_rank.unwrap_or(0));
+                    }
+                    Ok(params)
                 } else {
                     // READ mode: prefill waits for decode to pull blocks.
                     Ok(json!({
@@ -814,7 +822,7 @@ impl VllmPDRouter {
 
         // Add kv_transfer_params for KV connector support at top level
         prefill_request["kv_transfer_params"] =
-            self.build_prefill_kv_transfer_params(transfer_id.as_deref(), Some(&decode_base_http))?;
+            self.build_prefill_kv_transfer_params(transfer_id.as_deref(), Some(&decode_base_http), prefill_dp_rank)?;
 
         debug!(
             "Added kv_transfer_params to prefill request for {:?} connector",
@@ -1191,7 +1199,7 @@ impl VllmPDRouter {
         // Add kv_transfer_params for KV connector support at top level
         let decode_base_url = decode_worker.base_url().to_string();
         prefill_request["kv_transfer_params"] = self
-            .build_prefill_kv_transfer_params(transfer_id.as_deref(), Some(&decode_base_url))
+            .build_prefill_kv_transfer_params(transfer_id.as_deref(), Some(&decode_base_url), decode_worker.dp_rank())
             .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
 
         debug!(
