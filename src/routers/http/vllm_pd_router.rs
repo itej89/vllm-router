@@ -20,6 +20,7 @@ use axum::{
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
@@ -54,6 +55,8 @@ pub struct VllmPDRouter {
     profiling_tasks: Arc<Mutex<HashMap<String, tokio::task::AbortHandle>>>,
     /// Intra-node data parallel size for DP-aware routing (automatically enabled when > 1)
     intra_node_data_parallel_size: usize,
+    /// Round-robin counter for selecting prefill DP rank when workers register without @rank suffix
+    prefill_dp_round_robin: Arc<AtomicUsize>,
     /// KV connector type
     kv_connector: KvConnector,
     /// Mooncake bootstrap info: prefill base_url -> MooncakePrefillInfo
@@ -199,7 +202,12 @@ impl VllmPDRouter {
     ///
     /// Returns an error for MoRI-IO when no transfer mode has been registered yet, so that
     /// requests are not silently dispatched in READ mode when no instances have registered.
-    fn build_prefill_kv_transfer_params(&self, transfer_id: Option<&str>) -> Result<Value, String> {
+    fn build_prefill_kv_transfer_params(
+        &self,
+        transfer_id: Option<&str>,
+        decode_base: Option<&str>,
+        decode_dp_rank: Option<usize>,
+    ) -> Result<Value, String> {
         match self.kv_connector {
             KvConnector::Mooncake => Ok(json!({
                 "do_remote_decode": true,
@@ -215,17 +223,29 @@ impl VllmPDRouter {
                 if matches!(mode, MoriIOTransferMode::Write) {
                     // WRITE mode: prefill pushes KV blocks to decode.
                     // do_remote_decode=true tells the prefill connector to initiate the transfer.
-                    Ok(json!({
+                    let remote_tp_size = decode_base
+                        .map(|base| {
+                            self.service_registry
+                                .get_tp_dp_size(base, ServiceType::Decode)
+                                .0
+                        })
+                        .unwrap_or(1);
+                    let mut params = json!({
                         "do_remote_decode": true,
                         "do_remote_prefill": false,
                         "remote_engine_id": serde_json::Value::Null,
                         "remote_block_ids": serde_json::Value::Null,
                         "remote_dp_size": self.intra_node_data_parallel_size,
-                        // remote_tp_size is not yet consumed by the vLLM MoRI-IO connector;
-                        // hardcoded to 1 until https://github.com/vllm-project/vllm/issues/41211 is resolved.
-                        "remote_tp_size": 1,
+                        "remote_tp_size": remote_tp_size,
                         "transfer_id": transfer_id.unwrap_or(""),
-                    }))
+                    });
+                    if self.intra_node_data_parallel_size > 1 {
+                        // Tell prefill which decode DP rank to push KV to.
+                        // The connector uses this to compute the correct port offset:
+                        //   handshake_port + get_port_offset(remote_dp_rank, tp_rank)
+                        params["remote_dp_rank"] = json!(decode_dp_rank.unwrap_or(0));
+                    }
+                    Ok(params)
                 } else {
                     // READ mode: prefill waits for decode to pull blocks.
                     Ok(json!({
@@ -279,6 +299,12 @@ impl VllmPDRouter {
             KvConnector::MoriIO => {
                 if matches!(self.moriio_transfer_mode(), Some(MoriIOTransferMode::Write)) {
                     // WRITE mode: build decode params directly; decode does not need the prefill response.
+                    let prefill_base = prefill_url
+                        .trim_start_matches("http://")
+                        .trim_start_matches("https://");
+                    let (tp_size, _) = self
+                        .service_registry
+                        .get_tp_dp_size(prefill_base, ServiceType::Prefill);
                     let mut params = json!({
                         "do_remote_decode": false,
                         "do_remote_prefill": true,
@@ -286,14 +312,15 @@ impl VllmPDRouter {
                         "remote_block_ids": serde_json::Value::Null,
                         "transfer_id": transfer_id.unwrap_or(""),
                         "remote_dp_size": self.intra_node_data_parallel_size,
-                        // remote_tp_size is not yet consumed by the vLLM MoRI-IO connector;
-                        // hardcoded to 1 until https://github.com/vllm-project/vllm/issues/41211 is resolved.
-                        "remote_tp_size": 1,
+                        "remote_tp_size": tp_size,
                     });
                     if self.intra_node_data_parallel_size > 1 {
-                        if let Some(rank) = prefill_dp_rank {
-                            params["remote_dp_rank"] = json!(rank);
-                        }
+                        // Always set remote_dp_rank so decode sends its RDMA block-address
+                        // notification to the correct prefill DP worker's notify port.
+                        // prefill_dp_rank is None only for non-MoRIIO connectors or when DP=1;
+                        // for WRITE mode with DP>1 the round-robin selection above always fills it.
+                        let rank = prefill_dp_rank.unwrap_or(0);
+                        params["remote_dp_rank"] = json!(rank);
                     }
                     Some(params)
                 } else {
@@ -773,20 +800,34 @@ impl VllmPDRouter {
         // Generate a connector-specific transfer_id (None for NIXL)
         let transfer_id = self.generate_transfer_id();
 
+        let (prefill_base_http, mut prefill_dp_rank) =
+            extract_base_http_and_dp_rank(prefill_http, self.intra_node_data_parallel_size);
+        let (decode_base_http, decode_dp_rank) =
+            extract_base_http_and_dp_rank(decode_http, self.intra_node_data_parallel_size);
+
+        // When workers register without @rank suffixes (service discovery path) and DP>1,
+        // select a DP rank via round-robin so we can route both the prefill X-data-parallel-rank
+        // header and the decode's remote_dp_rank to the same rank.
+        if self.intra_node_data_parallel_size > 1 && prefill_dp_rank.is_none() {
+            let rank = self
+                .prefill_dp_round_robin
+                .fetch_add(1, Ordering::Relaxed)
+                % self.intra_node_data_parallel_size;
+            prefill_dp_rank = Some(rank);
+            debug!(
+                "MoRIIO WRITE+DP: selected prefill dp_rank={} via round-robin (dp_size={})",
+                rank, self.intra_node_data_parallel_size
+            );
+        }
+
         // Add kv_transfer_params for KV connector support at top level
         prefill_request["kv_transfer_params"] =
-            self.build_prefill_kv_transfer_params(transfer_id.as_deref())?;
+            self.build_prefill_kv_transfer_params(transfer_id.as_deref(), Some(&decode_base_http), prefill_dp_rank)?;
 
         debug!(
             "Added kv_transfer_params to prefill request for {:?} connector",
             self.kv_connector
         );
-
-        let (prefill_base_http, prefill_dp_rank) =
-            extract_base_http_and_dp_rank(prefill_http, self.intra_node_data_parallel_size);
-        let (decode_base_http, decode_dp_rank) =
-            extract_base_http_and_dp_rank(decode_http, self.intra_node_data_parallel_size);
-
         // Concurrent dispatch: e.g. MoRI-IO WRITE mode
         let is_concurrent_dispatch = matches!(self.kv_connector, KvConnector::MoriIO)
             && matches!(self.moriio_transfer_mode(), Some(MoriIOTransferMode::Write));
@@ -925,10 +966,17 @@ impl VllmPDRouter {
             .header("Content-Type", "application/json")
             .header("X-Request-Id", &request_id); // Same P2P coordination metadata in header
 
-        // Add X-data-parallel-rank header using shared utilities
+        // Add X-data-parallel-rank header using shared utilities.
+        // In WRITE+EP discovery mode, decode_dp_rank is None (no @rank suffix in URL).
+        // Use prefill_dp_rank so both requests land on the same DP rank and KV ports align.
+        let effective_decode_dp_rank = if decode_dp_rank.is_none() && self.intra_node_data_parallel_size > 1 {
+            prefill_dp_rank
+        } else {
+            decode_dp_rank
+        };
         decode_request_builder =
-            dp_utils::add_dp_rank_header(decode_request_builder, decode_dp_rank);
-        if let Some(rank) = decode_dp_rank {
+            dp_utils::add_dp_rank_header(decode_request_builder, effective_decode_dp_rank);
+        if let Some(rank) = effective_decode_dp_rank {
             debug!(
                 "Added X-data-parallel-rank={} header to decode request",
                 rank
@@ -1156,8 +1204,9 @@ impl VllmPDRouter {
         let transfer_id = self.generate_transfer_id();
 
         // Add kv_transfer_params for KV connector support at top level
+        let decode_base_url = decode_worker.base_url().to_string();
         prefill_request["kv_transfer_params"] = self
-            .build_prefill_kv_transfer_params(transfer_id.as_deref())
+            .build_prefill_kv_transfer_params(transfer_id.as_deref(), Some(&decode_base_url), decode_worker.dp_rank())
             .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
 
         debug!(
@@ -1570,6 +1619,7 @@ impl VllmPDRouter {
                 profile_timeout_secs: ctx.router_config.profile_timeout_secs,
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
+                prefill_dp_round_robin: Arc::new(AtomicUsize::new(0)),
                 kv_connector,
                 mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
             })
@@ -1658,6 +1708,7 @@ impl VllmPDRouter {
                 profile_timeout_secs: ctx.router_config.profile_timeout_secs,
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
+                prefill_dp_round_robin: Arc::new(AtomicUsize::new(0)),
                 kv_connector,
                 mooncake_prefill_info,
             })
@@ -2539,7 +2590,11 @@ mod tests {
 
     // --- MoRI-IO WRITE mode parameter tests ---
 
-    fn moriio_write_prefill_params(transfer_id: Option<&str>, dp_size: usize) -> Value {
+    fn moriio_write_prefill_params(
+        transfer_id: Option<&str>,
+        dp_size: usize,
+        tp_size: usize,
+    ) -> Value {
         // Mirror the WRITE mode branch in build_prefill_kv_transfer_params.
         json!({
             "do_remote_decode": true,
@@ -2547,9 +2602,7 @@ mod tests {
             "remote_engine_id": serde_json::Value::Null,
             "remote_block_ids": serde_json::Value::Null,
             "remote_dp_size": dp_size,
-            // remote_tp_size is not yet consumed by the vLLM MoRI-IO connector;
-            // hardcoded to 1 until https://github.com/vllm-project/vllm/issues/41211 is resolved.
-            "remote_tp_size": 1,
+            "remote_tp_size": tp_size,
             "transfer_id": transfer_id.unwrap_or(""),
         })
     }
@@ -2581,12 +2634,12 @@ mod tests {
 
     #[test]
     fn test_moriio_write_prefill_params_has_do_remote_decode_true() {
-        let params = moriio_write_prefill_params(Some("tx-abc"), 1);
+        let params = moriio_write_prefill_params(Some("tx-abc"), 1, 8);
         assert_eq!(params["do_remote_decode"], true);
         assert_eq!(params["do_remote_prefill"], false);
         assert!(params["remote_engine_id"].is_null());
         assert!(params["remote_block_ids"].is_null());
-        assert_eq!(params["remote_tp_size"], 1);
+        assert_eq!(params["remote_tp_size"], 8);
         assert_eq!(params["remote_dp_size"], 1);
         assert_eq!(params["transfer_id"], "tx-abc");
     }
